@@ -3,7 +3,7 @@
 # Shows the positions of the fingers on a touchpad.
 # It interprets the MT protocol as defined in Linux Documentation/input/multi-touch-protocol.rst
 
-# Copyright 2010, Eric Piel <eric.piel@tremplin-utc.net>
+# Copyright 2010-2019, Eric Piel <eric.piel@tremplin-utc.net>
 
 # This file contains part of touchd - 2008, Scott Shawcroft, scott.shawcroft@gmail.com
 # This file uses pyinputevent available http://github.com/rmt/pyinputevent/ by Robert Thomson and individual contributors.
@@ -25,15 +25,18 @@
 # use a command like:
 # sudo python fingerviewer.py /dev/input/event1
 
-import pygtk
-import gtk
+from __future__ import division, print_function
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import GLib, Gtk, Gdk
+
 import math
 import time
 import threading
 import logging
+import cairo
 from pyinputevent import *
-
-gtk.gdk.threads_init()
 
 # As defined in include/uapi/linux/input-event-codes.h
 EV_SYN = 0x00
@@ -77,13 +80,11 @@ class MouseDevice(SimpleDevice):
     def __init__(self, viewer, *args, **kwargs):
         SimpleDevice.__init__(self, *args, **kwargs)
         self.viewer = viewer
-        self.x = 0
-        self.y = 0
         self.num = 0
         self.slot = 0
         self.slots = {} # int -> int "slot" = touch number -> tracking ID
         self.tid = 0
-        self.tids = {} # int -> (int, int): "tracking ID" = finger number -> X/Y
+        self.tids = {} # int -> (int, int, int): "tracking ID" = finger number -> X/Y/pressure 
 
     def receive(self, event):
     # In reality: slot only present, if more than one finger?
@@ -100,11 +101,16 @@ class MouseDevice(SimpleDevice):
         etype, ecode, evalue = event.etype, event.ecode, event.evalue
         if etype == EV_ABS:
             if ecode == ABS_MT_POSITION_X:
-                #self.x = evalue
                 self.tids[self.tid][0] = evalue
             elif ecode == ABS_MT_POSITION_Y:
-                #self.y = evalue
                 self.tids[self.tid][1] = evalue
+            elif ecode == ABS_PRESSURE:
+                if evalue == 0:  # 0 is just another way to say the finger is gone
+                    return
+                if self.tid in self.tids:
+                    self.tids[self.tid][2] = evalue
+                else:
+                    print("tracking ID %d is already gone" % (self.tid,))
             elif ecode == ABS_MT_SLOT:
                 self.slot = evalue
                 if evalue in self.slots:
@@ -116,14 +122,14 @@ class MouseDevice(SimpleDevice):
                         del self.slots[self.slot]
                 else:
                     self.tid = evalue
-                    if self.slot in self.slots:
-                        self.slots[self.slot] = evalue
-                    self.tids.setdefault(evalue, [0, 0])
+                    self.slots[self.slot] = evalue
+                    self.tids.setdefault(evalue, [0, 0, 0])
         elif etype == EV_SYN:
             if ecode == SYN_REPORT:
                 for i, pos in self.tids.items():
-                    viewer.got_finger(i, pos[0], pos[1], 0, 0, 10)
+                    viewer.update_finger(i, pos[0], pos[1], 0, 0, pos[2])
                     print("Finger %d at %s" % (i, pos))
+                viewer.draw_fingers() # TODO: should be automatic after a few finger updates
 #            elif ecode == SYN_MT_REPORT: # Only protocol A
 #               viewer.got_finger(self.num, self.x, self.y, 0, 0, 10)
 #               self.num += 1
@@ -135,89 +141,84 @@ class MouseDevice(SimpleDevice):
 XRES = 6000
 YRES = 5000
 YOFF = 0
+
+
 class FingerViewer(object):
     def __init__(self):
-        self.window = gtk.Window()
+        self._running = True
+        self.window = Gtk.Window()
         self.window.set_title("Fingers")
         self.width = 600
         self.height = 500
         self.window.width = self.width
         self.window.height = self.height
-        
-        self.window.connect("destroy", self.hide)
-        self.window.show()
-        
-        self.image = gtk.Image()
-        self.image.show()
-        self.window.add(self.image)
-        
-        pixmap = gtk.gdk.Pixmap(None,self.width,self.height,24)
-        self.image.set_from_pixmap(pixmap,None)
-        self.context = pixmap.cairo_create()
-        self.context.rectangle(0,0,self.width,self.height)
-        self.context.set_source_rgb(1,1,1)
-        self.context.fill()
-        
-        self.context.set_line_width(2)
-        
         self.fingers = []
-    
-    def got_finger(self,num,x,y,dx,dy,p):
-        self.fingers.append((num,x,y,dx,dy,p))
-        self.draw_all()
+        
+        self.window.connect("destroy", self.destroy)
 
-    def draw_all(self):
-        self.context.rectangle(0,0,self.width,self.height) # fill with white
-        self.context.set_source_rgb(1,1,1)
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.width,self.height)
+        self.context = cairo.Context(surface)
+        self.image = Gtk.Image.new_from_surface(surface)
+        self._draw_fingers()
+        self.image.show()
+
+        self.window.add(self.image)
+        self.window.show()
+
+    def update_finger(self,num,x,y,dx,dy,p):
+        self.fingers.append((num,x,y,dx,dy,p))
+
+    def draw_fingers(self):
+        """
+        Thread-safe version of draw_fingers()
+        """
+        GLib.idle_add(self._draw_fingers)
+
+    def _draw_fingers(self):
+        self.context.rectangle(0, 0, self.width, self.height) # fill with white
+        self.context.set_source_rgb(1, 1, 1)
         self.context.fill()
-        
-        for i in range(len(self.fingers)):
-            num,x,y,dx,dy,p = self.fingers[i]
-            self.draw_finger(num,x,y,dx,dy,p)
-        
+
+        for num,x,y,dx,dy,p in self.fingers:
+            self.draw_finger(num, x, y, dx, dy, p)
+
         self.image.queue_draw()
         self.fingers = []
 
-    def draw_finger(self,num,x,y,dx,dy,p):
-        dy*=-1
-        
+    def draw_finger(self, num, x, y, dx, dy, p):
         # draw the finger
-        tx = self.translate_x(x)
-        ty = self.translate_y(y)
-        self.context.arc(tx,ty,10+p/500.0*20,0,2*math.pi)
+        tx, ty = self.to_screen_coord(x, y)
+        self.context.arc(tx, ty, 10 + p / 3, 0, 2*math.pi)
         self.context.set_source_rgba(0,0,1)
         self.context.fill()
-        print("Drawing f%d at %d, %d" % (num, tx, ty))
 
         # draw the velocity
         VRES = 500
         VSCALE = 100
         self.context.set_source_rgb(0,0,0)
         self.context.move_to(tx,ty)
-        self.context.line_to(tx+(float(dx)/VRES)*VSCALE,ty-(float(dy)/VRES)*VSCALE)
+        self.context.line_to(tx+(float(dx)/VRES)*VSCALE,ty-(float(-dy)/VRES)*VSCALE)
         self.context.stroke()
         
         # draw number label
-        self.context.set_source_rgb(1,1,1)
+        self.context.set_source_rgb(1, 1, 1)
         self.context.move_to(tx-5,ty+5)
         self.context.set_font_size(15)
-        self.context.show_text(str(num+1))
+        self.context.show_text(str(num + 1))
     
-    def num_fingers(self,i):
+    def num_fingers(self, i):
         if i==0:
             self._wipe()
+
+    def to_screen_coord(self, x, y):
+        """
+        translate to the graphical coordinates
+        """
+        return x / XRES * self.width, (y + YOFF) / YRES* self.height
     
-    # translate to the graphical coordinates
-    def translate_x(self,v):
-        return ((float(v)/XRES)*(self.width))
-    
-    # translate to the graphical coordinates
-    def translate_y(self,v):
-        return ((float(v+YOFF)/YRES)*(self.height))
-    
-    def hide(self,widget):
-        #self.window.hide()
-        gtk.main_quit()
+    def destroy(self, _):
+        self._running = False
+        Gtk.main_quit()
 
     def readValues(self, args):
         import select
@@ -225,11 +226,11 @@ class FingerViewer(object):
         fds = {}
         poll = select.poll()
         dev = args
-        print dev
+        print(dev)
         dev = MouseDevice(self, dev)
         fds[dev.fileno()] = dev
         poll.register(dev, select.POLLIN | select.POLLPRI)
-        while True:
+        while self._running:
             for x,e in poll.poll():
                 dev = fds[x]
                 dev.read()
@@ -237,7 +238,7 @@ class FingerViewer(object):
 if __name__ == "__main__":
     viewer = FingerViewer()
     threading.Thread(target=viewer.readValues, args=sys.argv[1:]).start()
-    gtk.main()
+    Gtk.main()
 
 
 # vim:shiftwidth=4:expandtab:spelllang=en_gb:spell:         
